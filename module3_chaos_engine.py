@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 import struct
 import time
@@ -9,12 +10,13 @@ from module2_adaptive_engine import SecurityProfile
 
 ChaosModel = Literal["henon", "lorenz", "chen", "rossler"]
 
+
 @dataclass
 class ChaosParameters:
     model: ChaosModel
-    control: dict         
-    initial_state: Tuple[float, ...]   
-    dt: float = 0.01       
+    control: dict
+    initial_state: Tuple[float, ...]
+    dt: float = 0.01
     warmup_iterations: int = 0
     production_iterations: int = 0
 
@@ -28,6 +30,11 @@ class ChaosKeystreamResult:
     generation_time: float
     throughput_mbps: float
     diagnostics: dict = field(default_factory=dict)
+
+
+class ChaosInstabilityError(Exception):
+    """Raised when a chaotic trajectory diverges, overflows, or collapses into
+    a fixed point / short cycle, i.e. it is not usable as an entropy source."""
 
 
 def _counter_stream(seed: bytes, n_needed: int) -> bytes:
@@ -74,20 +81,29 @@ _PARAM_BANDS: dict = {
 
 
 DEMO_SPEEDUP_FACTOR = 25
-DEMO_MIN_ITERATIONS = 400   
+DEMO_MIN_ITERATIONS = 400
+STATE_BOUND = 1.0e4
+MIN_UNIQUE_RATIO = 0.95
+MIN_SAMPLE_FOR_UNIQUENESS = 100
+MAX_DERIVATION_ATTEMPTS = 16
 
 
 def derive_dynamic_parameters(
     seed: bytes,
     profile: SecurityProfile,
     demo_mode: bool = False,
+    attempt: int = 0,
 ) -> ChaosParameters:
+    
     model = profile.chaos_model
     band = _PARAM_BANDS[model]
 
     n_control = len(band["control"])
     n_state = len(band["state"])
-    stream = _counter_stream(seed + model.encode(), (n_control + n_state) * 8)
+    stream_seed = seed + model.encode()
+    if attempt > 0:
+        stream_seed += b"|retry|" + attempt.to_bytes(2, "big")
+    stream = _counter_stream(stream_seed, (n_control + n_state) * 8)
     floats = _bytes_to_unit_floats(stream)
 
     control = {}
@@ -171,16 +187,60 @@ def _pack_state(state: Tuple[float, ...]) -> bytes:
     return b"".join(struct.pack(">d", v) for v in state)
 
 
+def _check_state(state: Tuple[float, ...]) -> None:
+    for v in state:
+        if not math.isfinite(v) or abs(v) > STATE_BOUND:
+            raise ChaosInstabilityError(
+                f"trajectory left the allowed range (value = {v!r})"
+            )
+
+
 def generate_raw_entropy(params: ChaosParameters) -> bytes:
     gen = _GENERATORS[params.model](params)
 
-    for _ in range(params.warmup_iterations):
-        next(gen)
+    try:
+        state = params.initial_state
+        for _ in range(params.warmup_iterations):
+            state = next(gen)
+        _check_state(state)
 
-    raw = bytearray()
-    for _ in range(params.production_iterations):
-        raw += _pack_state(next(gen))
+        raw = bytearray()
+        seen_first = set()
+        for _ in range(params.production_iterations):
+            state = next(gen)
+            _check_state(state)
+            seen_first.add(state[0])
+            raw += _pack_state(state)
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise ChaosInstabilityError(f"numeric failure: {exc}") from exc
+
+    if params.production_iterations >= MIN_SAMPLE_FOR_UNIQUENESS:
+        unique_ratio = len(seen_first) / params.production_iterations
+        if unique_ratio < MIN_UNIQUE_RATIO:
+            raise ChaosInstabilityError(
+                f"trajectory is (nearly) periodic: only {unique_ratio:.1%} distinct values"
+            )
     return bytes(raw)
+
+
+def generate_validated_entropy(
+    seed: bytes,
+    profile: SecurityProfile,
+    demo_mode: bool = False,
+):
+    last_error = None
+    for attempt in range(MAX_DERIVATION_ATTEMPTS):
+        params = derive_dynamic_parameters(seed, profile, demo_mode=demo_mode, attempt=attempt)
+        try:
+            raw = generate_raw_entropy(params)
+        except ChaosInstabilityError as exc:
+            last_error = exc
+            continue
+        return params, raw, attempt + 1
+    raise ChaosInstabilityError(
+        f"no valid chaotic trajectory after {MAX_DERIVATION_ATTEMPTS} attempts "
+        f"(last error: {last_error})"
+    )
 
 
 def whiten_to_keystream(raw_entropy: bytes, output_length: int) -> bytes:
@@ -192,7 +252,7 @@ def _keystream_diagnostics(keystream: bytes) -> dict:
     ones = sum(bin(byte).count("1") for byte in keystream)
     monobit_ratio = ones / total_bits
 
-    # Simple byte uniformity check 
+    # Simple byte uniformity check
     hist = [0] * 256
     for b in keystream:
         hist[b] += 1
@@ -200,8 +260,8 @@ def _keystream_diagnostics(keystream: bytes) -> dict:
     chi_sq = sum((count - expected) ** 2 / expected for count in hist) if expected > 0 else 0.0
 
     return {
-        "monobit_ratio": round(monobit_ratio, 4), 
-        "byte_chi_square": round(chi_sq, 2),         
+        "monobit_ratio": round(monobit_ratio, 4),
+        "byte_chi_square": round(chi_sq, 2),
         "sample_bytes_hex": keystream[:16].hex(),
     }
 
@@ -229,8 +289,7 @@ def run_chaos_module(
 
     t_start = time.perf_counter()
 
-    params = derive_dynamic_parameters(seed, profile, demo_mode=demo_mode)
-    raw = generate_raw_entropy(params)
+    params, raw, attempts = generate_validated_entropy(seed, profile, demo_mode=demo_mode)
     keystream = whiten_to_keystream(raw, output_length)
 
     t_end = time.perf_counter()
@@ -239,8 +298,8 @@ def run_chaos_module(
     throughput = size_mb / gen_time if gen_time > 0 else float("inf")
 
     diagnostics = _keystream_diagnostics(keystream)
-
     diagnostics["demo_mode"] = demo_mode
+    diagnostics["derivation_attempts"] = attempts
 
     result = ChaosKeystreamResult(
         model=profile.chaos_model,
@@ -257,13 +316,15 @@ def run_chaos_module(
         print(f"  {'Initial state':<25} { tuple(round(v, 5) for v in params.initial_state) }")
         print(f"  {'Warm-up iterations':<25} {params.warmup_iterations:,}")
         print(f"  {'Production iterations':<25} {params.production_iterations:,}")
+        print(f"  {'Trajectory attempts':<25} {attempts} (1 = first derivation was stable)")
         print(f"  {'Raw entropy collected':<25} {len(raw):,} bytes")
         print(f"  {'Keystream length':<25} {len(keystream)} bytes ({result.keystream_bits} bits)")
         print(f"  {'Generation time':<25} {gen_time * 1000:.4f} ms")
         print(f"  {'Throughput':<25} {throughput:.2f} MB/s")
         print()
         print(f"  [+] Monobit ratio     : {diagnostics['monobit_ratio']}  (ideal ≈ 0.5000)")
-        print(f"  [+] Byte chi-square   : {diagnostics['byte_chi_square']}  (ideal ≈ 255 for 256 bins)")
+        print(f"  [+] Byte chi-square   : {diagnostics['byte_chi_square']}  "
+              f"(informational only: too few bytes for a statistical verdict)")
         print(f"  [+] Keystream preview : {diagnostics['sample_bytes_hex']} …")
         print("\n")
 
